@@ -1,0 +1,446 @@
+require("dotenv").config();
+const express = require("express");
+const http = require("http");
+const { Server } = require("socket.io");
+const authMiddleware = require("./auth");
+const { registerUser, loginUser, JWT_SECRET } = require("./users");
+const { rooms } = require("./rooms");
+const questions = require("./questions");
+const shop = require("./shop");
+const powerUps = require("./powerUps");
+const gameModes = require("./gameModes");
+const hostCommands = require("./host");
+const jwt = require("jsonwebtoken");
+const cors = require("cors");
+
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: { origin: "*" }
+});
+
+app.use(cors());
+app.use(express.json());
+app.use(express.static("public"));
+
+// --- AUTH ROUTES ---
+app.post("/api/register", async (req, res) => {
+  try {
+    const { username, email, password } = req.body;
+    await registerUser(username, email, password);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.post("/api/login", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const { token, user } = await loginUser(email, password);
+    res.json({ token, user });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// --- SOCKET.IO ---
+io.on("connection", (socket) => {
+  console.log("New connection:", socket.id);
+
+  // Join room
+  socket.on("joinRoom", ({ token, roomCode }) => {
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      socket.user = decoded;
+      if (!rooms[roomCode]) {
+        rooms[roomCode] = {
+          players: {},
+          scores: {},
+          xp: {},
+          coins: {},
+          host: socket.id,
+          mode: "classic",
+          themes: "default",
+        };
+      }
+      rooms[roomCode].players[socket.id] = decoded.username;
+      rooms[roomCode].scores[socket.id] = 0;
+      rooms[roomCode].xp[socket.id] = 0;
+      rooms[roomCode].coins[socket.id] = 0;
+
+      socket.join(roomCode);
+      io.to(roomCode).emit("roomUpdate", rooms[roomCode]);
+      console.log(`${decoded.username} joined room ${roomCode}`);
+    } catch (e) {
+      socket.emit("error", "Invalid token");
+    }
+  });
+
+  // Chat & game events
+  socket.on("answer", (data) => gameModes.handleAnswer(socket, data, io, rooms, questions));
+  socket.on("usePowerUp", (data) => powerUps.use(socket, data, io, rooms));
+  socket.on("buyPowerUp", (data) => shop.buy(socket, data, io, rooms));
+  socket.on("hostAction", (data) => hostCommands.handle(socket, data, io, rooms));
+
+  socket.on("disconnect", () => {
+    for (let roomCode in rooms) {
+      if (rooms[roomCode].players[socket.id]) {
+        delete rooms[roomCode].players[socket.id];
+        delete rooms[roomCode].scores[socket.id];
+        delete rooms[roomCode].xp[socket.id];
+        delete rooms[roomCode].coins[socket.id];
+        io.to(roomCode).emit("roomUpdate", rooms[roomCode]);
+      }
+    }
+    console.log("Disconnected:", socket.id);
+  });
+});
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+// server/rooms.js
+module.exports.rooms = {};
+
+/**
+ * Utility functions to manage rooms
+ */
+function createRoom(roomCode, hostId, hostName) {
+  if (!module.exports.rooms[roomCode]) {
+    module.exports.rooms[roomCode] = {
+      players: {},       // socketId => username
+      scores: {},        // socketId => points
+      xp: {},            // socketId => XP
+      coins: {},         // socketId => coins
+      streak: {},        // socketId => correct answer streak
+      host: hostId,
+      mode: "classic",
+      paused: false,
+      themes: "default",
+    };
+    // Add host
+    module.exports.rooms[roomCode].players[hostId] = hostName;
+    module.exports.rooms[roomCode].scores[hostId] = 0;
+    module.exports.rooms[roomCode].xp[hostId] = 0;
+    module.exports.rooms[roomCode].coins[hostId] = 0;
+    module.exports.rooms[roomCode].streak[hostId] = 0;
+  }
+  return module.exports.rooms[roomCode];
+}
+
+function addPlayer(roomCode, socketId, username) {
+  const room = module.exports.rooms[roomCode];
+  if (!room) return null;
+  room.players[socketId] = username;
+  room.scores[socketId] = 0;
+  room.xp[socketId] = 0;
+  room.coins[socketId] = 0;
+  room.streak[socketId] = 0;
+  return room;
+}
+
+function removePlayer(roomCode, socketId) {
+  const room = module.exports.rooms[roomCode];
+  if (!room) return;
+  delete room.players[socketId];
+  delete room.scores[socketId];
+  delete room.xp[socketId];
+  delete room.coins[socketId];
+  delete room.streak[socketId];
+  // If host left, assign new host
+  if (room.host === socketId) {
+    const ids = Object.keys(room.players);
+    room.host = ids.length ? ids[0] : null;
+  }
+}
+
+function getRoom(roomCode) {
+  return module.exports.rooms[roomCode];
+}
+
+module.exports = {
+  rooms: module.exports.rooms,
+  createRoom,
+  addPlayer,
+  removePlayer,
+  getRoom,
+};
+// server/shop.js
+const powerUps = require("./powerUps");
+const { rooms, getRoom } = require("./rooms");
+
+/**
+ * List of items in the shop
+ */
+const shopItems = {
+  double: { price: 50, type: "powerUp" },
+  freeze: { price: 75, type: "powerUp" },
+  shield: { price: 100, type: "powerUp" },
+  themeDark: { price: 200, type: "theme" },
+  themeNeon: { price: 300, type: "theme" },
+};
+
+/**
+ * Buy an item from the shop
+ * @param {*} socket Socket.IO socket
+ * @param {*} data { roomCode, item }
+ * @param {*} io Socket.IO server instance
+ */
+function buy(socket, data, io) {
+  const { roomCode, item } = data;
+  const room = getRoom(roomCode);
+  if (!room) return;
+
+  const userCoins = room.coins[socket.id] || 0;
+  const shopItem = shopItems[item];
+
+  if (!shopItem) {
+    socket.emit("shopError", "Item does not exist");
+    return;
+  }
+
+  if (userCoins < shopItem.price) {
+    socket.emit("shopError", "Not enough coins");
+    return;
+  }
+
+  // Deduct coins
+  room.coins[socket.id] -= shopItem.price;
+
+  // Apply item
+  if (shopItem.type === "powerUp") {
+    if (!room.powerUps) room.powerUps = {};
+    if (!room.powerUps[socket.id]) room.powerUps[socket.id] = [];
+    room.powerUps[socket.id].push(item);
+  } else if (shopItem.type === "theme") {
+    room.themes = item;
+    io.to(roomCode).emit("themeChanged", item);
+  }
+
+  socket.emit("shopSuccess", { item, coins: room.coins[socket.id] });
+  io.to(roomCode).emit("roomUpdate", room);
+}
+
+module.exports = {
+  buy,
+  shopItems,
+};
+// server/powerUps.js
+const { getRoom } = require("./rooms");
+
+/**
+ * List of power-ups and their effects
+ * Example effects:
+ * - double: double points for next correct answer
+ * - freeze: freeze another player's answers for a few seconds
+ * - shield: protect yourself from negative effects
+ */
+const powerUpEffects = {
+  double: { name: "Double Points", duration: 1 }, // lasts 1 question
+  freeze: { name: "Freeze Player", duration: 5000 }, // 5 seconds
+  shield: { name: "Shield", duration: 5000 },
+};
+
+/**
+ * Use a power-up
+ * @param {*} socket Socket.IO socket
+ * @param {*} data { roomCode, targetId, powerUp }
+ * @param {*} io Socket.IO server instance
+ * @param {*} rooms Room storage
+ */
+function use(socket, data, io, rooms) {
+  const { roomCode, targetId, powerUp } = data;
+  const room = getRoom(roomCode);
+  if (!room) return;
+
+  if (!room.powerUps || !room.powerUps[socket.id] || !room.powerUps[socket.id].includes(powerUp)) {
+    socket.emit("powerUpError", "You don't have this power-up");
+    return;
+  }
+
+  // Remove used power-up
+  const index = room.powerUps[socket.id].indexOf(powerUp);
+  room.powerUps[socket.id].splice(index, 1);
+
+  switch (powerUp) {
+    case "double":
+      // Next correct answer gives double points
+      if (!room.doubleNext) room.doubleNext = {};
+      room.doubleNext[socket.id] = true;
+      socket.emit("powerUpUsed", "Double Points activated!");
+      break;
+
+    case "freeze":
+      // Freeze target player
+      if (targetId && room.players[targetId]) {
+        io.to(targetId).emit("freezePlayer", powerUpEffects.freeze.duration);
+        socket.emit("powerUpUsed", `You froze ${room.players[targetId]}!`);
+      }
+      break;
+
+    case "shield":
+      // Protect yourself from effects
+      if (!room.shields) room.shields = {};
+      room.shields[socket.id] = true;
+      socket.emit("powerUpUsed", "Shield activated!");
+      setTimeout(() => {
+        delete room.shields[socket.id];
+        socket.emit("powerUpExpired", "Your shield has expired");
+      }, powerUpEffects.shield.duration);
+      break;
+
+    default:
+      socket.emit("powerUpError", "Unknown power-up");
+  }
+
+  io.to(roomCode).emit("roomUpdate", room);
+}
+
+module.exports = {
+  use,
+  powerUpEffects,
+};
+// server/gameModes.js
+const { getRoom } = require("./rooms");
+
+/**
+ * Handles when a player answers a question
+ * @param {*} socket Socket.IO socket
+ * @param {*} data { roomCode, questionIndex, answer }
+ * @param {*} io Socket.IO server
+ * @param {*} rooms Room storage
+ * @param {*} questions Array of questions
+ */
+function handleAnswer(socket, data, io, rooms, questions) {
+  const { roomCode, questionIndex, answer } = data;
+  const room = getRoom(roomCode);
+  if (!room) return;
+
+  const username = room.players[socket.id];
+  const correctAnswer = questions[questionIndex].correct;
+
+  if (answer === correctAnswer) {
+    // Calculate points
+    let points = 10; // base points
+    room.streak[socket.id] = (room.streak[socket.id] || 0) + 1;
+
+    // Apply streak bonus
+    if (room.streak[socket.id] > 1) points += room.streak[socket.id] * 2;
+
+    // Apply double points power-up
+    if (room.doubleNext && room.doubleNext[socket.id]) {
+      points *= 2;
+      delete room.doubleNext[socket.id];
+    }
+
+    // Update scores, XP, coins
+    room.scores[socket.id] += points;
+    room.xp[socket.id] = (room.xp[socket.id] || 0) + 5; // XP per correct
+    room.coins[socket.id] = (room.coins[socket.id] || 0) + 5;
+
+    socket.emit("answerResult", { correct: true, points });
+  } else {
+    // Wrong answer
+    room.streak[socket.id] = 0;
+    socket.emit("answerResult", { correct: false, points: 0 });
+  }
+
+  io.to(roomCode).emit("roomUpdate", room);
+}
+
+/**
+ * Change game mode
+ * @param {*} roomCode Room ID
+ * @param {*} mode Mode name: classic, frenzy, rush, chaos, team, boss
+ */
+function setMode(roomCode, mode) {
+  const room = getRoom(roomCode);
+  if (!room) return;
+  room.mode = mode;
+}
+
+/**
+ * Example: Get leaderboard
+ */
+function getLeaderboard(roomCode) {
+  const room = getRoom(roomCode);
+  if (!room) return [];
+  return Object.entries(room.scores)
+    .map(([id, score]) => ({ username: room.players[id], score }))
+    .sort((a, b) => b.score - a.score);
+}
+
+module.exports = {
+  handleAnswer,
+  setMode,
+  getLeaderboard,
+};
+// server/host.js
+const { getRoom } = require("./rooms");
+const gameModes = require("./gameModes");
+
+/**
+ * Handle host commands
+ * @param {*} socket Socket.IO socket
+ * @param {*} data { roomCode, action, params }
+ * @param {*} io Socket.IO server
+ */
+function handle(socket, data, io, rooms) {
+  const { roomCode, action, params } = data;
+  const room = getRoom(roomCode);
+  if (!room) return;
+
+  // Only host can use these commands
+  if (room.host !== socket.id) {
+    socket.emit("hostError", "You are not the host");
+    return;
+  }
+
+  switch (action) {
+    case "pauseGame":
+      room.paused = true;
+      io.to(roomCode).emit("gamePaused", true);
+      break;
+
+    case "resumeGame":
+      room.paused = false;
+      io.to(roomCode).emit("gamePaused", false);
+      break;
+
+    case "endGame":
+      const leaderboard = gameModes.getLeaderboard(roomCode);
+      io.to(roomCode).emit("gameEnded", leaderboard);
+      // Reset room scores
+      for (let id in room.players) {
+        room.scores[id] = 0;
+        room.streak[id] = 0;
+      }
+      break;
+
+    case "setMode":
+      if (params && params.mode) {
+        gameModes.setMode(roomCode, params.mode);
+        io.to(roomCode).emit("modeChanged", params.mode);
+      }
+      break;
+
+    case "kickPlayer":
+      if (params && params.playerId && room.players[params.playerId]) {
+        io.to(params.playerId).emit("kicked", "You were removed by the host");
+        delete room.players[params.playerId];
+        delete room.scores[params.playerId];
+        delete room.xp[params.playerId];
+        delete room.coins[params.playerId];
+        io.to(roomCode).emit("roomUpdate", room);
+      }
+      break;
+
+    default:
+      socket.emit("hostError", "Unknown command");
+  }
+}
+
+module.exports = {
+  handle,
+};
+Initial commit - added server and game files
